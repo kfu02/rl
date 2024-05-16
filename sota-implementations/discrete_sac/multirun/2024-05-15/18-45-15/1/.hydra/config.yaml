@@ -1,53 +1,40 @@
-# task and env
 env:
   name: CartPole-v1
-  task: ""
+  task: ''
   library: gym
   seed: 42
   max_episode_steps: 500
-
-# collector
 collector:
   total_frames: 100000
   init_random_frames: 1000
   init_env_steps: 10000
   frames_per_batch: 500
-  reset_at_each_iter: False
-  device: "cpu"
+  reset_at_each_iter: false
+  device: cpu
   env_per_collector: 1
   num_workers: 1
-
   offline_frames: 10000
-
-# replay buffer
 replay_buffer:
-  prb: False # use prioritized experience replay
+  prb: false
   size: 1000000
   scratch_dir: null
-
-# optim
 optim:
   utd_ratio: 1.0
   gamma: 0.99
   batch_size: 256
-  online_ratio: 1.0
-
-  lr: 3.0e-4
+  online_ratio: 0.5
+  lr: 0.0003
   weight_decay: 0.0
   target_update_polyak: 0.995
   target_entropy_weight: 0.2
-  target_entropy: "auto"
+  target_entropy: auto
   loss_function: l2
-  # default is 0.98 but needs to be decreased for env
-  # with small action space
-
-# network
 network:
-  hidden_sizes: [256, 256]
+  hidden_sizes:
+  - 256
+  - 256
   activation: relu
-  device: "cpu"
-
-# logging
+  device: cpu
 logger:
   backend: wandb
   project_name: torchrl_example_discrete_sac
@@ -55,4 +42,4 @@ logger:
   exp_name: ${optim.online_ratio}_DiscreteSAC
   mode: online
   eval_iter: 5000
-  video: True
+  video: true

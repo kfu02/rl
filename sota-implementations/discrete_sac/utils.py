@@ -133,6 +133,60 @@ def make_collector(cfg, train_env, actor_model_explore):
     collector.set_seed(cfg.env.seed)
     return collector
 
+def get_random_offline_data(cfg, train_env):
+    scratch_dir=cfg.replay_buffer.scratch_dir
+
+    from torchrl.envs.utils import RandomPolicy
+
+    random_policy = RandomPolicy(train_env.action_spec)
+
+    device = cfg.collector.device
+    if device in ("", None):
+        if torch.cuda.is_available():
+            device = "cuda:0"
+        else:
+            device = "cpu"
+    device = torch.device(device)
+    collector = SyncDataCollector(
+        train_env,
+        random_policy,
+        init_random_frames=0,
+        frames_per_batch=cfg.collector.frames_per_batch,
+        total_frames=cfg.collector.offline_frames,
+        reset_at_each_iter=cfg.collector.reset_at_each_iter,
+        device=device,
+        storing_device="cpu",
+    )
+    collector.set_seed(cfg.env.seed)
+
+    with (
+        tempfile.TemporaryDirectory()
+        if scratch_dir is None
+        else nullcontext(scratch_dir)
+    ) as scratch_dir:
+        replay_buffer = TensorDictReplayBuffer(
+            pin_memory=False,
+            prefetch=3,
+            storage=LazyMemmapStorage(
+                cfg.collector.offline_frames,
+                scratch_dir=scratch_dir,
+                device=device,
+            ),
+            batch_size=int(cfg.optim.batch_size * (1-cfg.optim.online_ratio)),
+        )
+
+        # loop through the collector (with random data) and add it all to this ReplayBuffer
+        for i, tensordict in enumerate(collector):
+            tensordict = tensordict.reshape(-1)
+            current_frames = tensordict.numel()
+            print(current_frames)
+            # # HACK: add fake logits
+            # fake_logits = torch.empty(size=(current_frames, train_env.action_spec.space.n))
+            # tensordict["logits"] = fake_logits
+            replay_buffer.extend(tensordict)
+
+        collector.shutdown()
+        return replay_buffer
 
 def make_replay_buffer(
     batch_size,
@@ -296,6 +350,12 @@ def log_metrics(logger, metrics, step):
     for metric_name, metric_value in metrics.items():
         logger.log_scalar(metric_name, metric_value, step)
 
+def finish_logging(logger):
+    """
+    Needs to be called at end of training run for multirun with Hydra to work properly.
+    """
+    wandb_exp = logger.experiment
+    wandb_exp.finish()
 
 def get_activation(cfg):
     if cfg.network.activation == "relu":

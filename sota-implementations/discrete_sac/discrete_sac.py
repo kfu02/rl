@@ -23,8 +23,10 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from torchrl.record.loggers import generate_exp_name, get_logger
 from utils import (
+    get_random_offline_data,
     dump_video,
     log_metrics,
+    finish_logging,
     make_collector,
     make_environment,
     make_loss_module,
@@ -34,8 +36,9 @@ from utils import (
 )
 
 
-@hydra.main(version_base="1.1", config_path="", config_name="config")
+@hydra.main(version_base="1.1", config_path=".", config_name="config")
 def main(cfg: "DictConfig"):  # noqa: F821
+    print(cfg)
     device = cfg.network.device
     if device in ("", None):
         if torch.cuda.is_available():
@@ -54,11 +57,11 @@ def main(cfg: "DictConfig"):  # noqa: F821
             experiment_name=exp_name,
             wandb_kwargs={
                 "mode": cfg.logger.mode,
-                "config": dict(cfg),
                 "project": cfg.logger.project_name,
                 "group": cfg.logger.group_name,
             },
         )
+        logger.log_hparams(cfg)
 
     # Set seeds
     torch.manual_seed(cfg.env.seed)
@@ -77,13 +80,16 @@ def main(cfg: "DictConfig"):  # noqa: F821
     collector = make_collector(cfg, train_env, model[0])
 
     # Create replay buffer
-    replay_buffer = make_replay_buffer(
-        batch_size=cfg.optim.batch_size,
+    online_buffer = make_replay_buffer(
+        batch_size=int(cfg.optim.batch_size * cfg.optim.online_ratio),
         prb=cfg.replay_buffer.prb,
         buffer_size=cfg.replay_buffer.size,
         scratch_dir=cfg.replay_buffer.scratch_dir,
         device="cpu",
     )
+
+    # Create offline dataset
+    offline_buffer = get_random_offline_data(cfg, train_env)
 
     # Create optimizers
     optimizer_actor, optimizer_critic, optimizer_alpha = make_optimizer(
@@ -118,7 +124,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         tensordict = tensordict.reshape(-1)
         current_frames = tensordict.numel()
         # Add to replay buffer
-        replay_buffer.extend(tensordict.cpu())
+        online_buffer.extend(tensordict.cpu())
         collected_frames += current_frames
 
         # Optimization steps
@@ -130,17 +136,34 @@ def main(cfg: "DictConfig"):  # noqa: F821
                 alpha_losses,
             ) = ([], [], [])
             for _ in range(num_updates):
-                # Sample from replay buffer
-                sampled_tensordict = replay_buffer.sample()
-                if sampled_tensordict.device != device:
-                    sampled_tensordict = sampled_tensordict.to(
+                # Sample from online replay buffer
+                online_samples = online_buffer.sample()
+                if online_samples.device != device:
+                    online_samples = online_samples.to(
                         device, non_blocking=True
                     )
                 else:
-                    sampled_tensordict = sampled_tensordict.clone()
+                    online_samples = online_samples.clone()
+
+                # also sample from offline replay buffer
+                offline_samples = offline_buffer.sample()
+                if offline_samples.device != device:
+                    offline_samples = offline_samples.to(
+                        device, non_blocking=True
+                    )
+                else:
+                    offline_samples = offline_samples.clone()
+
+                # symmetric sampling
+
+                # NOTE: because the actor uses the "logits" key in the
+                # online_samples to compute probs, but the offline dataset
+                # does not, delete those entries before combining
+                del online_samples["logits"]
+                batch = torch.cat([online_samples, offline_samples])
 
                 # Compute loss
-                loss_out = loss_module(sampled_tensordict)
+                loss_out = loss_module(batch)
 
                 actor_loss, q_loss, alpha_loss = (
                     loss_out["loss_actor"],
@@ -173,7 +196,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
                 # Update priority
                 if prb:
-                    replay_buffer.update_priority(sampled_tensordict)
+                    online_buffer.update_priority(batch)
 
         training_time = time.time() - training_start
         episode_end = (
@@ -225,6 +248,9 @@ def main(cfg: "DictConfig"):  # noqa: F821
     end_time = time.time()
     execution_time = end_time - start_time
     torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
+
+    # needs to be called at end of training run for Hydra's multirun to work properly
+    finish_logging(logger)
 
 
 if __name__ == "__main__":
