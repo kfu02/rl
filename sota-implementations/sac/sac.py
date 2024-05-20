@@ -45,6 +45,7 @@ from utils import (
 
 @hydra.main(version_base="1.1", config_path="", config_name="config")
 def main(cfg: "DictConfig"):  # noqa: F821
+    print(cfg)
     device = cfg.network.device
     if device in ("", None):
         if torch.cuda.is_available():
@@ -63,11 +64,13 @@ def main(cfg: "DictConfig"):  # noqa: F821
             experiment_name=exp_name,
             wandb_kwargs={
                 "mode": cfg.logger.mode,
-                "config": dict(cfg),
                 "project": cfg.logger.project_name,
                 "group": cfg.logger.group_name,
             },
         )
+        # log params to wandb correctly
+        logger.log_hparams(cfg)
+
         # catch SIGINT at any point in training and exit gracefully
         signal_handler = catch_sigint(logger)
         signal.signal(signal.SIGINT, signal_handler)
