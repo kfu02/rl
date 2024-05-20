@@ -30,6 +30,7 @@ from torchrl.objectives.sac import SACLoss
 from torchrl.record import VideoRecorder
 
 import tempfile
+import sys
 
 # ====================================================================
 # My changes
@@ -37,7 +38,7 @@ import tempfile
 
 def get_random_offline_data(cfg, train_env):
     print("Creating offline dataset")
-    scratch_dir=cfg.replay_buffer.scratch_dir
+    scratch_dir=cfg.online_buffer.scratch_dir
 
     from torchrl.envs.utils import RandomPolicy
 
@@ -107,6 +108,19 @@ def catch_sigint(logger):
             finish_logging(logger)
         sys.exit("SIGINT sent during training!")
     return signal_handler
+
+def sample(replay_buffer, device):
+    """
+    Assumes replay_buffer has a fixed batch size
+    """
+    sampled_tensordict = replay_buffer.sample()
+    if sampled_tensordict.device != device:
+        sampled_tensordict = sampled_tensordict.to(
+            device, non_blocking=True
+        )
+    else:
+        sampled_tensordict = sampled_tensordict.clone()
+    return sampled_tensordict
 
 
 # ====================================================================

@@ -39,6 +39,7 @@ from utils import (
     get_random_offline_data,
     finish_logging,
     catch_sigint,
+    sample,
 )
 
 
@@ -87,15 +88,13 @@ def main(cfg: "DictConfig"):  # noqa: F821
     collector = make_collector(cfg, train_env, exploration_policy)
 
     # Create replay buffer
-    replay_buffer = make_replay_buffer(
+    online_buffer = make_replay_buffer(
         batch_size=cfg.optim.batch_size,
-        prb=cfg.replay_buffer.prb,
-        buffer_size=cfg.replay_buffer.size,
-        scratch_dir=cfg.replay_buffer.scratch_dir,
+        prb=cfg.online_buffer.prb,
+        buffer_size=cfg.online_buffer.size,
+        scratch_dir=cfg.online_buffer.scratch_dir,
         device="cpu",
     )
-    # TODO: rename replay_buffer to "online_buffer"
-    # TODO: merge online/offline later
     offline_buffer = get_random_offline_data(cfg, train_env)
 
     # Create optimizers
@@ -116,7 +115,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         * cfg.collector.frames_per_batch
         * cfg.optim.utd_ratio
     )
-    prb = cfg.replay_buffer.prb
+    prb = cfg.online_buffer.prb
     eval_iter = cfg.logger.eval_iter
     frames_per_batch = cfg.collector.frames_per_batch
     eval_rollout_steps = cfg.env.max_episode_steps
@@ -133,7 +132,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         tensordict = tensordict.reshape(-1)
         current_frames = tensordict.numel()
         # Add to replay buffer
-        replay_buffer.extend(tensordict.cpu())
+        online_buffer.extend(tensordict.cpu())
         collected_frames += current_frames
 
         # Optimization steps
@@ -141,17 +140,17 @@ def main(cfg: "DictConfig"):  # noqa: F821
         if collected_frames >= init_random_frames:
             losses = TensorDict({}, batch_size=[num_updates])
             for i in range(num_updates):
-                # Sample from replay buffer
-                sampled_tensordict = replay_buffer.sample()
-                if sampled_tensordict.device != device:
-                    sampled_tensordict = sampled_tensordict.to(
-                        device, non_blocking=True
-                    )
-                else:
-                    sampled_tensordict = sampled_tensordict.clone()
+                # symmetric sampling
+                online_batch = sample(online_buffer, device)
+                # loc/scale are merely intermediate states for the actor, and
+                # do not exist in the offline data
+                del online_batch["loc"] 
+                del online_batch["scale"] 
+                offline_batch = sample(offline_buffer, device)
+                batch = torch.cat([online_batch, offline_batch])
 
                 # Compute loss
-                loss_td = loss_module(sampled_tensordict)
+                loss_td = loss_module(batch)
 
                 actor_loss = loss_td["loss_actor"]
                 q_loss = loss_td["loss_qvalue"]
@@ -181,7 +180,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
                 # Update priority
                 if prb:
-                    replay_buffer.update_priority(sampled_tensordict)
+                    online_buffer.update_priority(sampled_tensordict)
 
         training_time = time.time() - training_start
         episode_end = (
@@ -231,6 +230,8 @@ def main(cfg: "DictConfig"):  # noqa: F821
     end_time = time.time()
     execution_time = end_time - start_time
     torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
+    if logger is not None:
+        finish_logging(logger)
 
 
 if __name__ == "__main__":

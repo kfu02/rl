@@ -20,7 +20,7 @@ collector:
   offline_frames: 10_000
 
 # replay buffer
-replay_buffer:
+online_buffer:
   size: 1000000
   prb: 0 # use prioritized experience replay
   scratch_dir: null
@@ -51,7 +51,7 @@ network:
 logger:
   backend: wandb
   project_name: torchrl_example_sac
-  group_name: null
+  group_name: test-sym-sampling
   exp_name: ${env.name}_SAC
   mode: online
   eval_iter: 25000
