@@ -10,6 +10,10 @@ It supports state environments like MuJoCo.
 
 The helper functions are coded in the utils.py associated with this script.
 """
+import signal
+import sys
+import pprint
+
 import time
 
 import hydra
@@ -32,11 +36,17 @@ from utils import (
     make_replay_buffer,
     make_sac_agent,
     make_sac_optimizer,
+    # my changes
+    get_random_offline_data,
+    finish_logging,
+    catch_sigint,
+    sample,
 )
 
 
 @hydra.main(version_base="1.1", config_path="", config_name="config")
 def main(cfg: "DictConfig"):  # noqa: F821
+    pprint.pp(cfg)
     device = cfg.network.device
     if device in ("", None):
         if torch.cuda.is_available():
@@ -55,14 +65,19 @@ def main(cfg: "DictConfig"):  # noqa: F821
             experiment_name=exp_name,
             wandb_kwargs={
                 "mode": cfg.logger.mode,
-                "config": dict(cfg),
                 "project": cfg.logger.project_name,
                 "group": cfg.logger.group_name,
             },
         )
+        # log params to wandb correctly
+        logger.log_hparams(cfg)
 
-    torch.manual_seed(cfg.env.seed)
-    np.random.seed(cfg.env.seed)
+        # catch SIGINT at any point in training and exit gracefully
+        signal_handler = catch_sigint(logger)
+        signal.signal(signal.SIGINT, signal_handler)
+
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
 
     # Create environments
     train_env, eval_env = make_environment(cfg, logger=logger)
@@ -77,13 +92,14 @@ def main(cfg: "DictConfig"):  # noqa: F821
     collector = make_collector(cfg, train_env, exploration_policy)
 
     # Create replay buffer
-    replay_buffer = make_replay_buffer(
+    online_buffer = make_replay_buffer(
         batch_size=cfg.optim.batch_size,
-        prb=cfg.replay_buffer.prb,
-        buffer_size=cfg.replay_buffer.size,
-        scratch_dir=cfg.replay_buffer.scratch_dir,
+        prb=cfg.online_buffer.prb,
+        buffer_size=cfg.online_buffer.size,
+        scratch_dir=cfg.online_buffer.scratch_dir,
         device="cpu",
     )
+    offline_buffer = get_random_offline_data(cfg, train_env)
 
     # Create optimizers
     (
@@ -101,9 +117,8 @@ def main(cfg: "DictConfig"):  # noqa: F821
     num_updates = int(
         cfg.collector.env_per_collector
         * cfg.collector.frames_per_batch
-        * cfg.optim.utd_ratio
     )
-    prb = cfg.replay_buffer.prb
+    prb = cfg.online_buffer.prb
     eval_iter = cfg.logger.eval_iter
     frames_per_batch = cfg.collector.frames_per_batch
     eval_rollout_steps = cfg.env.max_episode_steps
@@ -120,39 +135,48 @@ def main(cfg: "DictConfig"):  # noqa: F821
         tensordict = tensordict.reshape(-1)
         current_frames = tensordict.numel()
         # Add to replay buffer
-        replay_buffer.extend(tensordict.cpu())
+        online_buffer.extend(tensordict.cpu())
         collected_frames += current_frames
 
         # Optimization steps
         training_start = time.time()
         if collected_frames >= init_random_frames:
+            # TODO: this losses batch_size should be wrong for the critic when
+            # UTD != 1? but it doesn't crash?
             losses = TensorDict({}, batch_size=[num_updates])
             for i in range(num_updates):
-                # Sample from replay buffer
-                sampled_tensordict = replay_buffer.sample()
-                if sampled_tensordict.device != device:
-                    sampled_tensordict = sampled_tensordict.to(
-                        device, non_blocking=True
-                    )
-                else:
-                    sampled_tensordict = sampled_tensordict.clone()
+                last_loss = None
+                for g in range(cfg.optim.utd_ratio):
+                    # symmetric sampling
+                    online_batch = sample(online_buffer, device)
+                    # loc/scale are merely intermediate states for the actor, and
+                    # do not exist in the offline data
+                    del online_batch["loc"] 
+                    del online_batch["scale"] 
+                    offline_batch = sample(offline_buffer, device)
+                    batch = torch.cat([online_batch, offline_batch])
 
-                # Compute loss
-                loss_td = loss_module(sampled_tensordict)
+                    # Compute loss
+                    loss_td = loss_module(batch)
+                    last_loss = loss_td # save last for actor/alpha
 
+                    q_loss = loss_td["loss_qvalue"]
+
+                    # Update critic
+                    optimizer_critic.zero_grad()
+                    # TODO: I don't know if this is right, but I was getting
+                    # "second pass through computation graph" errors without it
+                    q_loss.backward(retain_graph=True)
+                    optimizer_critic.step()
+
+                # update only once (not affected by UTD)
                 actor_loss = loss_td["loss_actor"]
-                q_loss = loss_td["loss_qvalue"]
                 alpha_loss = loss_td["loss_alpha"]
 
                 # Update actor
                 optimizer_actor.zero_grad()
                 actor_loss.backward()
                 optimizer_actor.step()
-
-                # Update critic
-                optimizer_critic.zero_grad()
-                q_loss.backward()
-                optimizer_critic.step()
 
                 # Update alpha
                 optimizer_alpha.zero_grad()
@@ -168,7 +192,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
                 # Update priority
                 if prb:
-                    replay_buffer.update_priority(sampled_tensordict)
+                    online_buffer.update_priority(sampled_tensordict)
 
         training_time = time.time() - training_start
         episode_end = (
@@ -218,6 +242,8 @@ def main(cfg: "DictConfig"):  # noqa: F821
     end_time = time.time()
     execution_time = end_time - start_time
     torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
+    if logger is not None:
+        finish_logging(logger)
 
 
 if __name__ == "__main__":

@@ -24,10 +24,105 @@ from torchrl.envs.libs.gym import GymEnv, set_gym_backend
 from torchrl.envs.transforms import InitTracker, RewardSum, StepCounter
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import MLP, ProbabilisticActor, ValueOperator
+from layer_norm_mlp import LayerNormMLP
 from torchrl.modules.distributions import TanhNormal
 from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
+from torchrl.objectives.redq import REDQLoss
 from torchrl.record import VideoRecorder
+
+import tempfile
+import sys
+
+# ====================================================================
+# My changes
+# -----------------
+
+def get_random_offline_data(cfg, train_env):
+    print("Creating offline dataset")
+    scratch_dir=cfg.online_buffer.scratch_dir
+
+    from torchrl.envs.utils import RandomPolicy
+
+    random_policy = RandomPolicy(train_env.action_spec)
+
+    device = cfg.collector.device
+    if device in ("", None):
+        if torch.cuda.is_available():
+            device = "cuda:0"
+        else:
+            device = "cpu"
+    device = torch.device(device)
+    collector = SyncDataCollector(
+        train_env,
+        random_policy,
+        init_random_frames=0,
+        frames_per_batch=cfg.collector.frames_per_batch,
+        total_frames=cfg.collector.offline_frames,
+        reset_at_each_iter=cfg.collector.reset_at_each_iter,
+        device=device,
+        storing_device="cpu",
+    )
+    collector.set_seed(cfg.seed)
+
+    with (
+        tempfile.TemporaryDirectory()
+        if scratch_dir is None
+        else nullcontext(scratch_dir)
+    ) as scratch_dir:
+        replay_buffer = TensorDictReplayBuffer(
+            pin_memory=False,
+            prefetch=3,
+            storage=LazyMemmapStorage(
+                cfg.collector.offline_frames,
+                scratch_dir=scratch_dir,
+                device=device,
+            ),
+            batch_size=int(cfg.optim.batch_size * (1-cfg.optim.online_ratio)),
+        )
+
+        # loop through the collector (with random data) and add it all to this ReplayBuffer
+        for i, tensordict in enumerate(collector):
+            tensordict = tensordict.reshape(-1)
+            current_frames = tensordict.numel()
+            print(current_frames)
+            replay_buffer.extend(tensordict)
+
+        collector.shutdown()
+        return replay_buffer
+
+
+def finish_logging(logger):
+    """
+    Needs to be called at end of training run for multirun with Hydra to work properly.
+    """
+    wandb_exp = logger.experiment
+    wandb_exp.finish()
+
+
+def catch_sigint(logger):
+    """
+    Catch SIGINTs gracefully and ensure finish_logging() is called before the script exits.
+    """
+    def signal_handler(sig, frame):
+        print('SIGINT caught, exiting gracefully...')
+        if logger:
+            finish_logging(logger)
+        sys.exit("SIGINT sent during training!")
+    return signal_handler
+
+def sample(replay_buffer, device):
+    """
+    Assumes replay_buffer has a fixed batch size
+    """
+    sampled_tensordict = replay_buffer.sample()
+    if sampled_tensordict.device != device:
+        sampled_tensordict = sampled_tensordict.to(
+            device, non_blocking=True
+        )
+    else:
+        sampled_tensordict = sampled_tensordict.clone()
+    return sampled_tensordict
 
 
 # ====================================================================
@@ -77,7 +172,7 @@ def make_environment(cfg, logger=None):
         EnvCreator(partial),
         serial_for_single=True,
     )
-    parallel_env.set_seed(cfg.env.seed)
+    parallel_env.set_seed(cfg.seed)
 
     train_env = apply_env_transforms(parallel_env, cfg.env.max_episode_steps)
 
@@ -113,7 +208,7 @@ def make_collector(cfg, train_env, actor_model_explore):
         total_frames=cfg.collector.total_frames,
         device=cfg.collector.device,
     )
-    collector.set_seed(cfg.env.seed)
+    collector.set_seed(cfg.seed)
     return collector
 
 
@@ -150,7 +245,6 @@ def make_replay_buffer(
             batch_size=batch_size,
         )
     return replay_buffer
-
 
 # ====================================================================
 # Model
@@ -205,13 +299,18 @@ def make_sac_agent(cfg, train_env, eval_env, device):
     )
 
     # Define Critic Network
+    norm_class = None
+    if cfg.critic.norm_class is not None:
+        norm_class = getattr(nn, cfg.critic.norm_class)
+
     qvalue_net_kwargs = {
         "num_cells": cfg.network.hidden_sizes,
         "out_features": 1,
         "activation_class": get_activation(cfg),
+        "norm_class": norm_class,
     }
 
-    qvalue_net = MLP(
+    qvalue_net = LayerNormMLP(
         **qvalue_net_kwargs,
     )
 
@@ -238,15 +337,23 @@ def make_sac_agent(cfg, train_env, eval_env, device):
 
 def make_loss_module(cfg, model):
     """Make loss module and target network updater."""
-    # Create SAC loss
-    loss_module = SACLoss(
+    # https://pytorch.org/rl/stable/reference/generated/torchrl.objectives.REDQLoss.html?highlight=redq#torchrl.objectives.REDQLoss
+    # made all of the optional params explicit  
+    loss_module = REDQLoss(
         actor_network=model[0],
         qvalue_network=model[1],
-        num_qvalue_nets=2,
+        num_qvalue_nets=10,
+        sub_sample_len=2,
         loss_function=cfg.optim.loss_function,
-        delay_actor=False,
-        delay_qvalue=True,
         alpha_init=cfg.optim.alpha_init,
+        min_alpha=0.1,
+        max_alpha=10.0,
+        fixed_alpha=False,
+        target_entropy="auto", # TODO: auto = -dim(A), RLPD recommends -dim(A)/2)
+        delay_qvalue=True,
+        gSDE=False,
+        separate_losses=False,
+        reduction="mean", # what to apply to the ensemble output
     )
     loss_module.make_value_estimator(gamma=cfg.optim.gamma)
 
