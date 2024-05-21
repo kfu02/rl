@@ -27,6 +27,7 @@ from torchrl.modules import MLP, ProbabilisticActor, ValueOperator
 from torchrl.modules.distributions import TanhNormal
 from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
+from torchrl.objectives.redq import REDQLoss
 from torchrl.record import VideoRecorder
 
 import tempfile
@@ -330,15 +331,23 @@ def make_sac_agent(cfg, train_env, eval_env, device):
 
 def make_loss_module(cfg, model):
     """Make loss module and target network updater."""
-    # Create SAC loss
-    loss_module = SACLoss(
+    # https://pytorch.org/rl/stable/reference/generated/torchrl.objectives.REDQLoss.html?highlight=redq#torchrl.objectives.REDQLoss
+    # made all of the optional params explicit  
+    loss_module = REDQLoss(
         actor_network=model[0],
         qvalue_network=model[1],
-        num_qvalue_nets=2,
+        num_qvalue_nets=10,
+        sub_sample_len=2,
         loss_function=cfg.optim.loss_function,
-        delay_actor=False,
-        delay_qvalue=True,
         alpha_init=cfg.optim.alpha_init,
+        min_alpha=0.1,
+        max_alpha=10.0,
+        fixed_alpha=False,
+        target_entropy="auto", # TODO: auto = -dim(A), RLPD recommends -dim(A)/2)
+        delay_qvalue=True,
+        gSDE=False,
+        separate_losses=False,
+        reduction="mean", # what to apply to the ensemble output
     )
     loss_module.make_value_estimator(gamma=cfg.optim.gamma)
 

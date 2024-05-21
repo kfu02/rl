@@ -27,7 +27,7 @@ online_buffer:
 
 # optim
 optim:
-  utd_ratio: 1.0
+  utd_ratio: 20.0
   gamma: 0.99
   loss_function: l2
   lr: 3.0e-4
@@ -51,7 +51,7 @@ network:
 logger:
   backend: wandb
   project_name: torchrl_example_sac
-  group_name: test-sym-sampling
+  group_name: test-redq
   exp_name: ${env.name}_SAC
   mode: online
   eval_iter: 25000

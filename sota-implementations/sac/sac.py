@@ -12,6 +12,7 @@ The helper functions are coded in the utils.py associated with this script.
 """
 import signal
 import sys
+import pprint
 
 import time
 
@@ -45,7 +46,7 @@ from utils import (
 
 @hydra.main(version_base="1.1", config_path="", config_name="config")
 def main(cfg: "DictConfig"):  # noqa: F821
-    print(cfg)
+    pprint.pp(cfg)
     device = cfg.network.device
     if device in ("", None):
         if torch.cuda.is_available():
@@ -161,7 +162,9 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
                 # Update actor
                 optimizer_actor.zero_grad()
-                actor_loss.backward()
+                # TODO: I don't know if this is right, but I was getting
+                # "second pass through computation graph" errors without it
+                actor_loss.backward(retain_graph=True)
                 optimizer_actor.step()
 
                 # Update critic
