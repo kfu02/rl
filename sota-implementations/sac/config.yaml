@@ -9,8 +9,8 @@ env:
 
 # collector
 collector:
-  total_frames: 100_000
-  init_random_frames: 25000
+  total_frames: 10_000
+  init_random_frames: 1000
   frames_per_batch: 1000
   init_env_steps: 1000
   device: cpu
@@ -27,7 +27,7 @@ online_buffer:
 
 # optim
 optim:
-  utd_ratio: 20.0
+  utd_ratio: 10
   gamma: 0.99
   loss_function: l2
   lr: 3.0e-4
@@ -41,17 +41,21 @@ optim:
 
 # network
 network:
+  # TODO: separate hidden_sizes to actor/critic
   hidden_sizes: [256, 256]
   activation: relu
   default_policy_scale: 1.0
   scale_lb: 0.1
-  device:
+  device: null
+
+critic:
+  norm_class: LayerNorm
 
 # logging
 logger:
   backend: wandb
   project_name: torchrl_example_sac
-  group_name: test-redq
+  group_name: test-rlpd-2
   exp_name: ${env.name}_SAC
   mode: online
   eval_iter: 25000

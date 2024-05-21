@@ -117,7 +117,6 @@ def main(cfg: "DictConfig"):  # noqa: F821
     num_updates = int(
         cfg.collector.env_per_collector
         * cfg.collector.frames_per_batch
-        * cfg.optim.utd_ratio
     )
     prb = cfg.online_buffer.prb
     eval_iter = cfg.logger.eval_iter
@@ -142,35 +141,42 @@ def main(cfg: "DictConfig"):  # noqa: F821
         # Optimization steps
         training_start = time.time()
         if collected_frames >= init_random_frames:
+            # TODO: this losses batch_size should be wrong for the critic when
+            # UTD != 1? but it doesn't crash?
             losses = TensorDict({}, batch_size=[num_updates])
             for i in range(num_updates):
-                # symmetric sampling
-                online_batch = sample(online_buffer, device)
-                # loc/scale are merely intermediate states for the actor, and
-                # do not exist in the offline data
-                del online_batch["loc"] 
-                del online_batch["scale"] 
-                offline_batch = sample(offline_buffer, device)
-                batch = torch.cat([online_batch, offline_batch])
+                last_loss = None
+                for g in range(cfg.optim.utd_ratio):
+                    # symmetric sampling
+                    online_batch = sample(online_buffer, device)
+                    # loc/scale are merely intermediate states for the actor, and
+                    # do not exist in the offline data
+                    del online_batch["loc"] 
+                    del online_batch["scale"] 
+                    offline_batch = sample(offline_buffer, device)
+                    batch = torch.cat([online_batch, offline_batch])
 
-                # Compute loss
-                loss_td = loss_module(batch)
+                    # Compute loss
+                    loss_td = loss_module(batch)
+                    last_loss = loss_td # save last for actor/alpha
 
+                    q_loss = loss_td["loss_qvalue"]
+
+                    # Update critic
+                    optimizer_critic.zero_grad()
+                    # TODO: I don't know if this is right, but I was getting
+                    # "second pass through computation graph" errors without it
+                    q_loss.backward(retain_graph=True)
+                    optimizer_critic.step()
+
+                # update only once (not affected by UTD)
                 actor_loss = loss_td["loss_actor"]
-                q_loss = loss_td["loss_qvalue"]
                 alpha_loss = loss_td["loss_alpha"]
 
                 # Update actor
                 optimizer_actor.zero_grad()
-                # TODO: I don't know if this is right, but I was getting
-                # "second pass through computation graph" errors without it
-                actor_loss.backward(retain_graph=True)
+                actor_loss.backward()
                 optimizer_actor.step()
-
-                # Update critic
-                optimizer_critic.zero_grad()
-                q_loss.backward()
-                optimizer_critic.step()
 
                 # Update alpha
                 optimizer_alpha.zero_grad()

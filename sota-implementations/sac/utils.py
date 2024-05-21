@@ -24,6 +24,7 @@ from torchrl.envs.libs.gym import GymEnv, set_gym_backend
 from torchrl.envs.transforms import InitTracker, RewardSum, StepCounter
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import MLP, ProbabilisticActor, ValueOperator
+from layer_norm_mlp import LayerNormMLP
 from torchrl.modules.distributions import TanhNormal
 from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
@@ -298,13 +299,18 @@ def make_sac_agent(cfg, train_env, eval_env, device):
     )
 
     # Define Critic Network
+    norm_class = None
+    if cfg.critic.norm_class is not None:
+        norm_class = getattr(nn, cfg.critic.norm_class)
+
     qvalue_net_kwargs = {
         "num_cells": cfg.network.hidden_sizes,
         "out_features": 1,
         "activation_class": get_activation(cfg),
+        "norm_class": norm_class,
     }
 
-    qvalue_net = MLP(
+    qvalue_net = LayerNormMLP(
         **qvalue_net_kwargs,
     )
 
